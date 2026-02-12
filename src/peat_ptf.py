@@ -21,8 +21,19 @@ Units:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
+    from numpy.typing import ArrayLike
+else:
+    try:
+        import numpy as np
+        from numpy.typing import ArrayLike
+    except ImportError:  # numpy is optional for core PTF functions
+        np = None  # type: ignore[assignment]
+        ArrayLike = Any  # type: ignore[assignment,misc]
 
 
 # ---------------------------------------------------------------------------
@@ -31,17 +42,30 @@ from typing import Optional
 
 @dataclass
 class MVGParameters:
-    """Mualem-van Genuchten hydraulic parameter set."""
+    """Mualem-van Genuchten hydraulic parameter set.
+
+    The residual water content ``theta_r`` defaults to **0.0** for peat soils,
+    which is the standard assumption in the literature (e.g. Schwärzel et al.,
+    2006; Liu & Lennartz, 2019).  Override it when a measured value is
+    available.
+    """
     theta_s: float   # saturated water content (cm³ cm⁻³)
     alpha: float     # van Genuchten α (cm⁻¹)
     n: float         # van Genuchten n (dimensionless)
     Ks: float        # saturated hydraulic conductivity (cm h⁻¹)
     tau: float       # Mualem tortuosity τ (dimensionless)
+    theta_r: float = 0.0  # residual water content (cm³ cm⁻³)
+
+    @property
+    def m(self) -> float:
+        """van Genuchten *m* parameter (``1 − 1/n``)."""
+        return 1.0 - 1.0 / self.n
 
     def __repr__(self) -> str:
         return (
-            f"MVGParameters(θs={self.theta_s:.4f}, α={self.alpha:.4f}, "
-            f"n={self.n:.4f}, Ks={self.Ks:.4f}, τ={self.tau:.4f})"
+            f"MVGParameters(θs={self.theta_s:.4f}, θr={self.theta_r:.4f}, "
+            f"α={self.alpha:.4f}, n={self.n:.4f}, "
+            f"Ks={self.Ks:.4f}, τ={self.tau:.4f})"
         )
 
 
@@ -472,6 +496,373 @@ def get_mvg_parameters(
             f"Unknown method '{method}'; "
             "expected 'ptf', 'grouped_mvg', or 'grouped_ptf'."
         )
+
+
+# ---------------------------------------------------------------------------
+# Van Genuchten water retention & hydraulic conductivity curves
+# ---------------------------------------------------------------------------
+
+def _require_numpy() -> None:
+    """Raise an informative error if NumPy is not installed."""
+    if np is None:
+        raise ImportError(
+            "NumPy is required for water-retention and conductivity "
+            "functions.  Install it with:  pip install numpy"
+        )
+
+
+def vg_water_retention(
+    h: ArrayLike,
+    params: MVGParameters,
+    theta_r: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Compute the **van Genuchten water retention curve** θ(h).
+
+    .. math::
+
+        \\theta(h) = \\theta_r
+            + \\frac{\\theta_s - \\theta_r}{[1 + (\\alpha |h|)^n]^m}
+
+    where *m = 1 − 1/n*.
+
+    Parameters
+    ----------
+    h : array_like
+        Pressure head (cm).  Negative values denote unsaturated conditions
+        (suction); positive values are clamped to saturation.
+    params : MVGParameters
+        MVG parameter set (must contain θs, α, n and, optionally, θr).
+    theta_r : float or None, optional
+        Override the residual water content.  When ``None`` the value stored
+        in *params* is used (default 0.0 for peat soils).
+
+    Returns
+    -------
+    np.ndarray
+        Volumetric water content θ (cm³ cm⁻³) at each pressure head.
+    """
+    _require_numpy()
+    h = np.asarray(h, dtype=float)
+    tr = theta_r if theta_r is not None else params.theta_r
+    ts = params.theta_s
+    alpha = params.alpha
+    n = params.n
+    m = 1.0 - 1.0 / n
+
+    # Use absolute value of h; at h >= 0 the soil is saturated
+    abs_h = np.abs(h)
+    theta = tr + (ts - tr) / (1.0 + (alpha * abs_h) ** n) ** m
+
+    # Saturated where h >= 0
+    theta = np.where(h >= 0, ts, theta)
+    return theta
+
+
+def vg_effective_saturation(
+    h: ArrayLike,
+    params: MVGParameters,
+    theta_r: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Effective saturation Se(h) ∈ [0, 1].
+
+    .. math::
+
+        S_e = \\frac{\\theta - \\theta_r}{\\theta_s - \\theta_r}
+            = \\frac{1}{[1 + (\\alpha |h|)^n]^m}
+    """
+    _require_numpy()
+    h = np.asarray(h, dtype=float)
+    tr = theta_r if theta_r is not None else params.theta_r
+    alpha = params.alpha
+    n = params.n
+    m = 1.0 - 1.0 / n
+
+    abs_h = np.abs(h)
+    Se = 1.0 / (1.0 + (alpha * abs_h) ** n) ** m
+    Se = np.where(h >= 0, 1.0, Se)
+    return Se
+
+
+def vg_hydraulic_conductivity(
+    h: ArrayLike,
+    params: MVGParameters,
+    theta_r: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Compute the **Mualem–van Genuchten unsaturated hydraulic conductivity**
+    K(h).
+
+    .. math::
+
+        K(h) = K_s \\, S_e^{\\tau}
+               \\left[1 - \\left(1 - S_e^{1/m}\\right)^m \\right]^2
+
+    Parameters
+    ----------
+    h : array_like
+        Pressure head (cm), negative = unsaturated.
+    params : MVGParameters
+        MVG parameter set.
+    theta_r : float or None, optional
+        Override residual water content.
+
+    Returns
+    -------
+    np.ndarray
+        Hydraulic conductivity K (cm h⁻¹) at each pressure head.
+    """
+    _require_numpy()
+    Se = vg_effective_saturation(h, params, theta_r=theta_r)
+    m = 1.0 - 1.0 / params.n
+    Ks = params.Ks
+    tau = params.tau
+
+    K = Ks * Se ** tau * (1.0 - (1.0 - Se ** (1.0 / m)) ** m) ** 2
+    return np.where(np.asarray(h, dtype=float) >= 0, Ks, K)
+
+
+def plot_swrc(
+    params_dict: dict[str, MVGParameters],
+    h_range: tuple[float, float] = (1e-2, 1e5),
+    n_points: int = 500,
+    theta_r: Optional[float] = None,
+    ax: Optional[object] = None,
+    log_x: bool = True,
+) -> object:
+    """
+    Plot **soil water retention curves** (SWRCs) for one or more MVG
+    parameter sets.
+
+    Parameters
+    ----------
+    params_dict : dict[str, MVGParameters]
+        Mapping of *label* → *MVGParameters*.  Each entry becomes one curve.
+    h_range : tuple[float, float], optional
+        Min and max |h| (cm) for the x-axis.  Default ``(0.01, 100000)``.
+    n_points : int, optional
+        Number of points along the h axis.  Default 500.
+    theta_r : float or None, optional
+        Override residual water content for all curves.
+    ax : matplotlib Axes or None, optional
+        Axes to draw on.  If ``None`` a new figure is created.
+    log_x : bool, optional
+        Use a log scale for the pressure-head axis (default ``True``).
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+    """
+    import matplotlib.pyplot as plt
+
+    h = np.logspace(np.log10(h_range[0]), np.log10(h_range[1]), n_points)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+    for label, params in params_dict.items():
+        theta = vg_water_retention(-h, params, theta_r=theta_r)
+        ax.plot(h, theta, linewidth=2, label=label)
+
+    ax.set_xlabel("|Pressure head|  (cm)")
+    ax.set_ylabel(r"Volumetric water content $\theta$  (cm$^3$ cm$^{-3}$)")
+    ax.set_title("Soil Water Retention Curves (van Genuchten)")
+    if log_x:
+        ax.set_xscale("log")
+    ax.legend(fontsize=9)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.set_ylim(bottom=0)
+    plt.tight_layout()
+    return ax
+
+
+def plot_k_curve(
+    params_dict: dict[str, MVGParameters],
+    h_range: tuple[float, float] = (1e-2, 1e5),
+    n_points: int = 500,
+    theta_r: Optional[float] = None,
+    ax: Optional[object] = None,
+) -> object:
+    """
+    Plot **unsaturated hydraulic conductivity** K(h) for one or more MVG
+    parameter sets.
+
+    Parameters (same as :func:`plot_swrc`).
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+    """
+    import matplotlib.pyplot as plt
+
+    h = np.logspace(np.log10(h_range[0]), np.log10(h_range[1]), n_points)
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(8, 5))
+
+    for label, params in params_dict.items():
+        if math.isnan(params.Ks):
+            continue
+        K = vg_hydraulic_conductivity(-h, params, theta_r=theta_r)
+        ax.plot(h, K, linewidth=2, label=label)
+
+    ax.set_xlabel("|Pressure head|  (cm)")
+    ax.set_ylabel(r"Hydraulic conductivity $K$  (cm h$^{-1}$)")
+    ax.set_title("Unsaturated Hydraulic Conductivity (Mualem–van Genuchten)")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.legend(fontsize=9)
+    ax.grid(True, which="both", alpha=0.3)
+    plt.tight_layout()
+    return ax
+
+
+def plot_mvg(
+    theta_s: float,
+    alpha: float,
+    n: float,
+    Ks: float = math.nan,
+    tau: float = 0.5,
+    theta_r: float = 0.0,
+    *,
+    label: str = "Custom MVG",
+    h_range: tuple[float, float] = (1e-2, 1e5),
+    n_points: int = 500,
+    show_k: bool = True,
+    figsize: tuple[float, float] = (14, 5),
+    colors: Optional[tuple[str, str]] = None,
+    ax_swrc: Optional[object] = None,
+    ax_k: Optional[object] = None,
+) -> object:
+    """
+    Plot a **customised MVG model** from individual parameter values.
+
+    Creates a side-by-side figure with the soil-water retention curve (left)
+    and the unsaturated hydraulic conductivity curve (right).  All six MVG
+    parameters can be specified directly – no need to build a
+    ``MVGParameters`` object first.
+
+    Parameters
+    ----------
+    theta_s : float
+        Saturated water content (cm³ cm⁻³).
+    alpha : float
+        van Genuchten α (cm⁻¹).
+    n : float
+        van Genuchten n (dimensionless, > 1).
+    Ks : float, optional
+        Saturated hydraulic conductivity (cm h⁻¹).  If ``NaN`` (default),
+        the K(h) panel is omitted.
+    tau : float, optional
+        Mualem tortuosity (default 0.5).
+    theta_r : float, optional
+        Residual water content (default 0.0).
+    label : str, optional
+        Legend label for the curve (default ``"Custom MVG"``).
+    h_range : tuple[float, float], optional
+        Min and max |h| in cm (default ``(0.01, 100000)``).
+    n_points : int, optional
+        Number of evaluation points (default 500).
+    show_k : bool, optional
+        Whether to include the K(h) panel (default ``True``).
+        Ignored when *Ks* is NaN.
+    figsize : tuple[float, float], optional
+        Figure size in inches (default ``(14, 5)``).
+    colors : tuple[str, str] or None, optional
+        ``(swrc_color, k_color)``.  If ``None``, matplotlib defaults are used.
+    ax_swrc : matplotlib Axes or None, optional
+        Pre-existing axes for the SWRC panel.
+    ax_k : matplotlib Axes or None, optional
+        Pre-existing axes for the K(h) panel.
+
+    Returns
+    -------
+    tuple[matplotlib.axes.Axes, matplotlib.axes.Axes | None]
+        The SWRC axes and (if plotted) the K(h) axes.
+
+    Examples
+    --------
+    >>> plot_mvg(theta_s=0.93, alpha=1.0, n=1.3, Ks=500, tau=-4.0)
+    >>> plot_mvg(theta_s=0.88, alpha=0.05, n=1.2, label="Dense peat")
+    """
+    import matplotlib.pyplot as plt
+
+    _require_numpy()
+    params = MVGParameters(
+        theta_s=theta_s, alpha=alpha, n=n,
+        Ks=Ks, tau=tau, theta_r=theta_r,
+    )
+    h = np.logspace(np.log10(h_range[0]), np.log10(h_range[1]), n_points)
+
+    plot_k = show_k and not math.isnan(Ks)
+
+    # ---- create figure / axes ----
+    if ax_swrc is None:
+        ncols = 2 if plot_k else 1
+        fig, axes = plt.subplots(1, ncols, figsize=figsize)
+        if ncols == 1:
+            ax_swrc = axes
+            ax_k_out = None
+        else:
+            ax_swrc, ax_k = axes
+            ax_k_out = ax_k
+    else:
+        fig = ax_swrc.figure
+        ax_k_out = ax_k
+
+    swrc_color = colors[0] if colors else None
+    k_color = colors[1] if colors and len(colors) > 1 else swrc_color
+
+    # ---- SWRC panel ----
+    theta = vg_water_retention(-h, params)
+    ax_swrc.plot(h, theta, linewidth=2, label=label, color=swrc_color)
+    ax_swrc.set_xscale("log")
+    ax_swrc.set_xlabel("|Pressure head|  (cm)")
+    ax_swrc.set_ylabel(r"$\theta$  (cm$^3$ cm$^{-3}$)")
+    ax_swrc.set_title("Soil Water Retention Curve")
+    ax_swrc.set_ylim(bottom=0)
+    ax_swrc.legend(fontsize=9)
+    ax_swrc.grid(True, which="both", alpha=0.3)
+
+    # Annotate parameter values
+    m = 1.0 - 1.0 / n
+    text = (
+        f"θs = {theta_s:.3f}\n"
+        f"θr = {theta_r:.3f}\n"
+        f"α  = {alpha:.4f}\n"
+        f"n  = {n:.4f}  (m = {m:.4f})"
+    )
+    ax_swrc.text(
+        0.97, 0.97, text, transform=ax_swrc.transAxes,
+        fontsize=8, verticalalignment="top", horizontalalignment="right",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="wheat", alpha=0.5),
+        fontfamily="monospace",
+    )
+
+    # ---- K(h) panel ----
+    if plot_k and ax_k is not None:
+        K = vg_hydraulic_conductivity(-h, params)
+        ax_k.plot(h, K, linewidth=2, label=label, color=k_color)
+        ax_k.set_xscale("log")
+        ax_k.set_yscale("log")
+        ax_k.set_xlabel("|Pressure head|  (cm)")
+        ax_k.set_ylabel(r"$K$  (cm h$^{-1}$)")
+        ax_k.set_title("Hydraulic Conductivity")
+        ax_k.legend(fontsize=9)
+        ax_k.grid(True, which="both", alpha=0.3)
+
+        k_text = f"Ks = {Ks:.4f}\nτ  = {tau:.4f}"
+        ax_k.text(
+            0.97, 0.97, k_text, transform=ax_k.transAxes,
+            fontsize=8, verticalalignment="top", horizontalalignment="right",
+            bbox=dict(boxstyle="round,pad=0.4", facecolor="wheat", alpha=0.5),
+            fontfamily="monospace",
+        )
+        ax_k_out = ax_k
+
+    plt.tight_layout()
+    return ax_swrc, ax_k_out
 
 
 # ---------------------------------------------------------------------------
