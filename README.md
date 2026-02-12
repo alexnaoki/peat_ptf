@@ -10,6 +10,7 @@ The module implements the regression equations from **Table 4** and the represen
 
 | Symbol | Description | Unit |
 |--------|-------------|------|
+| θr | Residual water content | cm³ cm⁻³ |
 | θs | Saturated water content | cm³ cm⁻³ |
 | α | van Genuchten alpha | cm⁻¹ |
 | n | van Genuchten n | — |
@@ -28,9 +29,13 @@ The module implements the regression equations from **Table 4** and the represen
 
 ## Installation
 
-No external dependencies are required — the module uses only the Python standard library.
+The module requires **NumPy** and (optionally) **Matplotlib** for plotting:
 
-Simply clone the repository and import from `src/`:
+```bash
+pip install numpy matplotlib
+```
+
+Clone the repository and import from `src/`:
 
 ```bash
 git clone <repo-url>
@@ -131,6 +136,73 @@ print(f"n  = {params.n:.4f}")
 | Woody | ≤ 0.2 | I (≤0.1), III (0.1–0.2), IV (>0.2) |
 | Sedge | ≤ 0.2 | I (≤0.1), II (0.1–0.2) |
 | All types | > 0.2 | I (>0.2) |
+
+---
+
+## Water Retention & Hydraulic Conductivity Curves
+
+The module also provides functions to compute and plot the van Genuchten
+water retention curve (SWRC) and the Mualem–van Genuchten unsaturated
+hydraulic conductivity curve K(h).
+
+> **Note:** The residual water content θr defaults to **0.0** for peat soils,
+> following the standard assumption in the literature.  Override it via
+> `theta_r=` when a measured value is available.
+
+### Computing θ(h) at specific pressure heads
+
+```python
+import numpy as np
+from peat_ptf import ptf_sphagnum, vg_water_retention
+
+params = ptf_sphagnum(BD=0.05, OM=95, depth=10)
+h = -np.array([0, 1, 10, 100, 1000, 10000])   # negative = suction
+theta = vg_water_retention(h, params)
+
+for h_val, t_val in zip(np.abs(h), theta):
+    print(f"|h| = {h_val:8.1f} cm  →  θ = {t_val:.4f}")
+```
+
+### Computing K(h)
+
+```python
+from peat_ptf import vg_hydraulic_conductivity
+
+K = vg_hydraulic_conductivity(h, params)
+```
+
+### Plotting SWRCs
+
+`plot_swrc()` accepts a dictionary of `{label: MVGParameters}` and draws all
+curves on a single axes:
+
+```python
+from peat_ptf import ptf_sphagnum, ptf_woody, plot_swrc
+
+curves = {
+    "Sphagnum (BD=0.05)": ptf_sphagnum(BD=0.05, OM=95, depth=10),
+    "Sphagnum (BD=0.15)": ptf_sphagnum(BD=0.15, OM=95, depth=10),
+    "Woody (BD=0.10)":    ptf_woody(BD=0.10, depth=20, OM=90),
+}
+plot_swrc(curves)
+```
+
+### Plotting K(h) curves
+
+```python
+from peat_ptf import plot_k_curve
+plot_k_curve(curves)
+```
+
+### API reference
+
+| Function | Description |
+|----------|-------------|
+| `vg_water_retention(h, params)` | θ(h) — volumetric water content at given pressure heads |
+| `vg_effective_saturation(h, params)` | Se(h) — effective saturation ∈ [0, 1] |
+| `vg_hydraulic_conductivity(h, params)` | K(h) — unsaturated hydraulic conductivity |
+| `plot_swrc(params_dict, ...)` | Convenience plot of one or more SWRCs |
+| `plot_k_curve(params_dict, ...)` | Convenience plot of one or more K(h) curves |
 
 ---
 
